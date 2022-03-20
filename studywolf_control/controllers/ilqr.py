@@ -37,11 +37,10 @@ class Control:
         """
 
         self.tN = n  # number of timesteps
-
         self.max_iter = max_iter
         self.lamb_factor = 10
         self.lamb_max = 1000
-        self.eps_converge = 0.0001  # exit if relative improvement below threshold
+        self.eps_converge = 0.001  # exit if relative improvement below threshold
 
     def cost(self, x, u):
         """the immediate state cost function"""
@@ -63,6 +62,26 @@ class Control:
 
     def cost_final(self, x):
         """the final state cost function"""
+
+        # Compute derivative of endpoint error
+        def dif_end(x):
+
+            xe = -self.target.copy()
+            for ii in range(self.arm.DOF):
+                xe[0] += self.arm.L[ii] * np.cos(np.sum(x[: ii + 1]))
+                xe[1] += self.arm.L[ii] * np.sin(np.sum(x[: ii + 1]))
+
+            edot = np.zeros((self.arm.DOF, 1))
+            for ii in range(self.arm.DOF):
+                edot[ii, 0] += (
+                    2
+                    * self.arm.L[ii]
+                    * (xe[0] * -np.sin(np.sum(x[: ii + 1])) + xe[1] * np.cos(np.sum(x[: ii + 1])))
+                )
+            edot = np.cumsum(edot[::-1])[::-1][:]
+
+            return edot
+
         num_states = x.shape[0]
         l_x = np.zeros((num_states))
         l_xx = np.zeros((num_states, num_states))
@@ -74,7 +93,7 @@ class Control:
         xy_err = np.array([xy[0] - self.target[0], xy[1] - self.target[1]])
         l = wp * np.sum(xy_err**2) + wv * np.sum(x[self.arm.DOF : self.arm.DOF * 2] ** 2)
 
-        l_x[0 : self.arm.DOF] = wp * self.dif_end(x[0 : self.arm.DOF])
+        l_x[0 : self.arm.DOF] = wp * dif_end(x[0 : self.arm.DOF])
         l_x[self.arm.DOF : self.arm.DOF * 2] = 2 * wv * x[self.arm.DOF : self.arm.DOF * 2]
 
         eps = 1e-4  # finite difference epsilon
@@ -82,33 +101,14 @@ class Control:
         for k in range(self.arm.DOF):
             veps = np.zeros(self.arm.DOF)
             veps[k] = eps
-            d1 = wp * self.dif_end(x[0 : self.arm.DOF] + veps)
-            d2 = wp * self.dif_end(x[0 : self.arm.DOF] - veps)
+            d1 = wp * dif_end(x[0 : self.arm.DOF] + veps)
+            d2 = wp * dif_end(x[0 : self.arm.DOF] - veps)
             l_xx[0 : self.arm.DOF, k] = ((d1 - d2) / 2.0 / eps).flatten()
 
         l_xx[self.arm.DOF : self.arm.DOF * 2, self.arm.DOF : self.arm.DOF * 2] = 2 * wv * np.eye(self.arm.DOF)
 
         # Final cost only requires these three values
         return l, l_x, l_xx
-
-    # Compute derivative of endpoint error
-    def dif_end(self, x):
-
-        xe = -self.target.copy()
-        for ii in range(self.arm.DOF):
-            xe[0] += self.arm.L[ii] * np.cos(np.sum(x[: ii + 1]))
-            xe[1] += self.arm.L[ii] * np.sin(np.sum(x[: ii + 1]))
-
-        edot = np.zeros((self.arm.DOF, 1))
-        for ii in range(self.arm.DOF):
-            edot[ii, 0] += (
-                2
-                * self.arm.L[ii]
-                * (xe[0] * -np.sin(np.sum(x[: ii + 1])) + xe[1] * np.cos(np.sum(x[: ii + 1])))
-            )
-        edot = np.cumsum(edot[::-1])[::-1][:]
-
-        return edot
 
     def finite_differences(self, x, u):
         """calculate gradient of plant dynamics using finite differences
@@ -145,24 +145,13 @@ class Control:
 
         return A, B
 
-    def gen_target(self, arm):
-        """Generate a random target"""
-        gain = np.sum(arm.L) * 0.75
-        bias = -np.sum(arm.L) * 0
-
-        self.target = np.random.random(size=(2,)) * gain + bias
-
-        return self.target.tolist()
-
-    def ilqr(self, x0, U=None):
+    def ilqr(self, x0, U):
         """use iterative linear quadratic regulation to find a control
         sequence that minimizes the cost function
 
         x0 np.array: the initial state of the system
         U np.array: the initial control trajectory dimensions = [dof, time]
         """
-        U = self.U if U is None else U
-
         tN = U.shape[0]  # number of time steps
         dof = self.arm.DOF  # number of degrees of freedom of plant
         num_states = dof * 2  # number of states (position and velocity)
