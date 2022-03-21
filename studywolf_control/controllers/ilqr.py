@@ -123,8 +123,8 @@ class Control:
         u np.array: the control signal
         """
 
-        f_x = finite_differences(lambda d: self.plant_dynamics(d, u)[0], x)
-        f_u = finite_differences(lambda d: self.plant_dynamics(x, d)[0], u)
+        f_x = finite_differences(lambda d: self.plant_dynamics(d, u), x)
+        f_u = finite_differences(lambda d: self.plant_dynamics(x, d), u)
 
         return f_x, f_u
 
@@ -135,18 +135,19 @@ class Control:
         x np.array: the state of the system
         u np.array: the control signal
         """
+        dof = self.arm.DOF
 
         # set the arm position to x
-        self.arm.reset(q=x[: self.arm.DOF], dq=x[self.arm.DOF : self.arm.DOF * 2])
+        self.arm.reset(q=x[:dof], dq=x[dof:])
 
         # apply the control signal
-        self.arm.apply_torque(u, self.arm.dt)
+        self.arm.apply_torque(u)
+
         # get the system state from the arm
         xnext = np.hstack([np.copy(self.arm.q), np.copy(self.arm.dq)])
-        # calculate the change in state
-        xdot = ((xnext - x) / self.arm.dt).squeeze()
 
-        return xdot, xnext
+        # calculate the change in state
+        return ((xnext - x) / self.arm.dt).squeeze()
 
     def ilqr(self, x0, U):
         """use iterative linear quadratic regulation to find a control
@@ -266,7 +267,7 @@ class Control:
                 # to take a stab at the optimal control signal
                 Unew[t] = U[t] + k[t] + np.dot(K[t], xnew - X[t])  # 7b)
                 # given this u, find our next state
-                _, xnew = self.plant_dynamics(xnew, Unew[t])  # 7c)
+                xnew += self.plant_dynamics(xnew, Unew[t]) * dt  # 7c)
 
             # evaluate the new trajectory
             Xnew, costnew = self.simulate(x0, Unew)
@@ -323,7 +324,7 @@ class Control:
 
         # Run simulation with substeps
         for t in range(tN - 1):
-            _, X[t + 1] = self.plant_dynamics(X[t], U[t])
+            X[t + 1] = self.plant_dynamics(X[t], U[t]) * dt + X[t]
             l, _, _, _, _, _ = self.cost(X[t], U[t])
             cost = cost + dt * l
 
