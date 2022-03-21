@@ -1,3 +1,7 @@
+import sys
+
+sys.path.append("/home/tom/repos/control/studywolf_control/controllers")
+
 from arms.three_link.arm import Arm
 from controllers.ilqr import Control
 import numpy as np

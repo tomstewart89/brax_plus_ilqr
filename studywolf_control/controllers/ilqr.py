@@ -17,11 +17,31 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
-import sys
-
-sys.path.append("/home/tom/repos/control/studywolf_control/controllers")
 
 import numpy as np
+
+
+def finite_differences(f, x, eps=1e-4):
+    """Differentiate a function `f` using finite differences"""
+
+    p = np.zeros_like(x)
+
+    for i in range(x.size):
+        p[i] = eps
+        df_dxi = (f(x + p) - f(x - p)) / (2 * eps)
+        p[i] = 0.0
+
+        if i == 0:
+            D = np.zeros((df_dxi.size, x.size))
+
+        D[:, i] = df_dxi
+
+    return D
+
+
+def to_cart(r, theta):
+    """Convert a polar coordinate (r,theta) into a cartesian coordinate"""
+    return r * np.array([np.cos(theta), np.sin(theta)])
 
 
 class Control:
@@ -41,9 +61,11 @@ class Control:
         self.lamb_factor = 10
         self.lamb_max = 1000
         self.eps_converge = 0.001  # exit if relative improvement below threshold
+        self.wp = 1e5  # terminal position cost weight
+        self.wv = 1e5  # terminal velocity cost weight
 
     def cost(self, x, u):
-        """the immediate state cost function"""
+        """the intermediate state cost function"""
         # compute cost
         dof = u.shape[0]
         num_states = x.shape[0]
@@ -53,6 +75,7 @@ class Control:
         # compute derivatives of cost
         l_x = np.zeros(num_states)
         l_xx = np.zeros((num_states, num_states))
+
         l_u = 2 * u
         l_uu = 2 * np.eye(dof)
         l_ux = np.zeros((dof, num_states))
@@ -63,87 +86,67 @@ class Control:
     def cost_final(self, x):
         """the final state cost function"""
 
-        # Compute derivative of endpoint error
-        def dif_end(x):
-
-            xe = -self.target.copy()
-            for ii in range(self.arm.DOF):
-                xe[0] += self.arm.L[ii] * np.cos(np.sum(x[: ii + 1]))
-                xe[1] += self.arm.L[ii] * np.sin(np.sum(x[: ii + 1]))
-
-            edot = np.zeros((self.arm.DOF, 1))
-            for ii in range(self.arm.DOF):
-                edot[ii, 0] += (
-                    2
-                    * self.arm.L[ii]
-                    * (xe[0] * -np.sin(np.sum(x[: ii + 1])) + xe[1] * np.cos(np.sum(x[: ii + 1])))
-                )
-            edot = np.cumsum(edot[::-1])[::-1][:]
-
-            return edot
-
         num_states = x.shape[0]
-        l_x = np.zeros((num_states))
+        dof = self.arm.DOF
+
+        l = self.wp * np.sum((self.arm.x - self.target) ** 2) + self.wv * np.sum(x[dof:] ** 2)
+
+        l_x = np.zeros(num_states)
+        l_x[:dof] = self.wp * self.endpoint_error_grad(x[:dof])
+        l_x[dof:] = 2 * self.wv * x[dof:]
+
         l_xx = np.zeros((num_states, num_states))
-
-        wp = 1e5  # terminal position cost weight
-        wv = 1e5  # terminal velocity cost weight
-
-        xy = self.arm.x
-        xy_err = np.array([xy[0] - self.target[0], xy[1] - self.target[1]])
-        l = wp * np.sum(xy_err**2) + wv * np.sum(x[self.arm.DOF : self.arm.DOF * 2] ** 2)
-
-        l_x[0 : self.arm.DOF] = wp * dif_end(x[0 : self.arm.DOF])
-        l_x[self.arm.DOF : self.arm.DOF * 2] = 2 * wv * x[self.arm.DOF : self.arm.DOF * 2]
-
-        eps = 1e-4  # finite difference epsilon
-        # calculate second derivative with finite differences
-        for k in range(self.arm.DOF):
-            veps = np.zeros(self.arm.DOF)
-            veps[k] = eps
-            d1 = wp * dif_end(x[0 : self.arm.DOF] + veps)
-            d2 = wp * dif_end(x[0 : self.arm.DOF] - veps)
-            l_xx[0 : self.arm.DOF, k] = ((d1 - d2) / 2.0 / eps).flatten()
-
-        l_xx[self.arm.DOF : self.arm.DOF * 2, self.arm.DOF : self.arm.DOF * 2] = 2 * wv * np.eye(self.arm.DOF)
+        l_xx[:dof, :dof] = self.wp * finite_differences(self.endpoint_error_grad, x[:dof])
+        l_xx[dof:, dof:] = 2 * self.wv * np.eye(dof)
 
         # Final cost only requires these three values
         return l, l_x, l_xx
 
-    def finite_differences(self, x, u):
-        """calculate gradient of plant dynamics using finite differences
+    def endpoint_error_grad(self, x):
+        """Compute derivative of endpoint error"""
+
+        end_pos = np.sum([to_cart(self.arm.L[i], np.sum(x[: i + 1])) for i in range(self.arm.DOF)], axis=0)
+        error = end_pos - self.target
+
+        error_dot = np.zeros(self.arm.DOF + 1)
+
+        for i in reversed(range(self.arm.DOF)):
+            theta = np.sum(x[: i + 1])
+            error_dot[i] = 2 * self.arm.L[i] * error.dot([-np.sin(theta), np.cos(theta)]) + error_dot[i + 1]
+
+        return error_dot[:-1]
+
+    def plant_dynamics_grad(self, x, u):
+        """calculate derivative of plant dynamics using finite differences
 
         x np.array: the state of the system
         u np.array: the control signal
         """
-        dof = u.shape[0]
-        num_states = x.shape[0]
 
-        A = np.zeros((num_states, num_states))
-        B = np.zeros((num_states, dof))
+        f_x = finite_differences(lambda d: self.plant_dynamics(d, u)[0], x)
+        f_u = finite_differences(lambda d: self.plant_dynamics(x, d)[0], u)
 
-        eps = 1e-4  # finite differences epsilon
-        for ii in range(num_states):
-            # calculate partial differential w.r.t. x
-            inc_x = x.copy()
-            inc_x[ii] += eps
-            state_inc, _ = self.plant_dynamics(inc_x, u.copy())
-            dec_x = x.copy()
-            dec_x[ii] -= eps
-            state_dec, _ = self.plant_dynamics(dec_x, u.copy())
-            A[:, ii] = (state_inc - state_dec) / (2 * eps)
+        return f_x, f_u
 
-        for ii in range(dof):
-            # calculate partial differential w.r.t. u
-            inc_u = u.copy()
-            inc_u[ii] += eps
-            state_inc, _ = self.plant_dynamics(x.copy(), inc_u)
-            dec_u = u.copy()
-            dec_u[ii] -= eps
-            state_dec, _ = self.plant_dynamics(x.copy(), dec_u)
-            B[:, ii] = (state_inc - state_dec) / (2 * eps)
+    def plant_dynamics(self, x, u):
+        """simulate a single time step of the plant, from
+        initial state x and applying control signal u
 
-        return A, B
+        x np.array: the state of the system
+        u np.array: the control signal
+        """
+
+        # set the arm position to x
+        self.arm.reset(q=x[: self.arm.DOF], dq=x[self.arm.DOF : self.arm.DOF * 2])
+
+        # apply the control signal
+        self.arm.apply_torque(u, self.arm.dt)
+        # get the system state from the arm
+        xnext = np.hstack([np.copy(self.arm.q), np.copy(self.arm.dq)])
+        # calculate the change in state
+        xdot = ((xnext - x) / self.arm.dt).squeeze()
+
+        return xdot, xnext
 
     def ilqr(self, x0, U):
         """use iterative linear quadratic regulation to find a control
@@ -187,7 +190,7 @@ class Control:
                     # linearized dx(t) = np.dot(A(t), x(t)) + np.dot(B(t), u(t))
                     # f_x = np.eye + A(t)
                     # f_u = B(t)
-                    A, B = self.finite_differences(X[t], U[t])
+                    A, B = self.plant_dynamics_grad(X[t], U[t])
                     f_x[t] = np.eye(num_states) + A * dt
                     f_u[t] = B * dt
 
@@ -302,26 +305,6 @@ class Control:
                     break
 
         return X, U, cost
-
-    def plant_dynamics(self, x, u):
-        """simulate a single time step of the plant, from
-        initial state x and applying control signal u
-
-        x np.array: the state of the system
-        u np.array: the control signal
-        """
-
-        # set the arm position to x
-        self.arm.reset(q=x[: self.arm.DOF], dq=x[self.arm.DOF : self.arm.DOF * 2])
-
-        # apply the control signal
-        self.arm.apply_torque(u, self.arm.dt)
-        # get the system state from the arm
-        xnext = np.hstack([np.copy(self.arm.q), np.copy(self.arm.dq)])
-        # calculate the change in state
-        xdot = ((xnext - x) / self.arm.dt).squeeze()
-
-        return xdot, xnext
 
     def simulate(self, x0, U):
         """do a rollout of the system, starting at x0 and
