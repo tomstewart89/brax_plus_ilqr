@@ -147,126 +147,6 @@ class Control:
         # get the system state from the arm
         return np.hstack([np.copy(self.arm.q), np.copy(self.arm.dq)])
 
-    def ilqr(self, x0, U):
-        """use iterative linear quadratic regulation to find a control
-        sequence that minimizes the cost function
-
-        x0 np.array: the initial state of the system
-        U np.array: the initial control trajectory dimensions = [dof, time]
-        """
-        tN = U.shape[0]  # number of time steps
-        dof = self.arm.DOF  # number of degrees of freedom of plant
-        num_states = x0.size  # number of states (position and velocity)
-
-        lamb = 1.0  # regularization parameter
-
-        # for storing linearized dynamics: x(t+1) = f(x(t), u(t))
-        f_x = np.zeros((tN, num_states, num_states))  # df / dx
-        f_u = np.zeros((tN, num_states, dof))  # df / du
-
-        # for storing quadratized cost function
-        l = np.zeros(tN)  # immediate state cost
-        l_x = np.zeros((tN, num_states))  # dl / dx
-        l_xx = np.zeros((tN, num_states, num_states))  # d^2 l / dx^2
-        l_u = np.zeros((tN, dof))  # dl / du
-        l_uu = np.zeros((tN, dof, dof))  # d^2 l / du^2
-        l_ux = np.zeros((tN, dof, num_states))  # d^2 l / du / dx
-
-        k = np.zeros((tN, dof))  # feedforward modification
-        K = np.zeros((tN, dof, num_states))  # feedback gain
-
-        # simulate forward using the current control trajectory
-        X, cost = self.simulate(x0, U)
-
-        for i in range(self.max_iter):
-
-            # now we linearly approximate the dynamics, and quadratically
-            # approximate the cost function so we can use LQR methods
-
-            # for everything except final state
-            for t in range(tN - 1):
-                f_x[t], f_u[t] = self.plant_dynamics_grad(X[t], U[t])
-                l[t], l_x[t], l_xx[t], l_u[t], l_uu[t], l_ux[t] = self.running_cost(X[t], U[t])
-
-            # aaaand for final state
-            l[-1], l_x[-1], l_xx[-1] = self.terminal_cost(X[-1])
-
-            # optimize things!
-            # initialize Vs with final state cost and set up k, K
-            V_x = l_x[-1].copy()  # dV / dx
-            V_xx = l_xx[-1].copy()  # d^2 V / dx^2
-
-            # work backwards to solve for V, Q, k, and K
-            for t in reversed(range(tN - 1)):
-
-                # NOTE: we're working backwards, so V_x = V_x[t+1] = V'_x
-                Q_x = l_x[t] + f_x[t].T @ V_x  # 4a)
-                Q_u = l_u[t] + f_u[t].T @ V_x  # 4b)
-
-                # NOTE: last term for Q_xx, Q_uu, and Q_ux is vector / tensor product
-                # but also note f_xx = f_uu = f_ux = 0 so they're all 0 anyways.
-                Q_xx = l_xx[t] + f_x[t].T @ V_xx @ f_x[t]  # 4c)
-                Q_ux = l_ux[t] + f_u[t].T @ V_xx @ f_x[t]  # 4d)
-                Q_uu = l_uu[t] + f_u[t].T @ V_xx @ f_u[t]  # 4e)
-
-                # Calculate Q_uu^-1 with regularization term set by
-                # Levenberg-Marquardt heuristic (at end of this loop)
-                Q_uu_evals, Q_uu_evecs = np.linalg.eig(Q_uu)
-                Q_uu_evals[Q_uu_evals < 0] = 0.0
-                Q_uu_evals += lamb
-                Q_uu_inv = Q_uu_evecs @ np.diag(1.0 / Q_uu_evals) @ Q_uu_evecs.T
-
-                k[t] = -Q_uu_inv @ Q_u  # 5b)
-                K[t] = -Q_uu_inv @ Q_ux  # 5b)
-
-                V_x = Q_x - K[t].T @ Q_uu @ k[t]  # 6b)
-                V_xx = Q_xx - K[t].T @ Q_uu @ K[t]  # 6c)
-
-            # calculate the optimal change to the control trajectory
-            Xnew = np.zeros((tN, num_states))
-            Unew = np.zeros((tN, dof))
-            Xnew[0] = x0
-            costnew = 0
-
-            for t in range(tN - 1):
-                # use feedforward (k) and feedback (K) gain matrices
-                # calculated from our value function approximation
-                # to take a stab at the optimal control signal
-                Unew[t] = U[t] + k[t] + K[t] @ (Xnew[t] - X[t])  # 7b)
-
-                costnew += self.running_cost(Xnew[t], Unew[t])[0]
-
-                # given this u, find our next state
-                Xnew[t + 1] = self.plant_dynamics(Xnew[t], Unew[t])  # 7c)
-
-            costnew += self.terminal_cost(Xnew[t])[0]
-
-            # Levenberg-Marquardt heuristic
-            if costnew < cost:
-                # decrease lambda (get closer to Newton's method)
-                lamb /= self.lamb_factor
-
-                X = Xnew  # update trajectory
-                U = Unew  # update control signal
-
-                improvement = abs(cost - costnew) / costnew
-                cost = costnew
-
-                # check to see if update is small enough to exit
-                if i > 0 and improvement < self.eps_converge:
-                    break
-
-            else:
-                # increase lambda (get closer to gradient descent)
-                lamb *= self.lamb_factor
-
-                if lamb > self.lamb_max:
-                    break
-
-        print("Finished at iteration = %d; Cost = %.4f; logLambda = %.1f" % (i, costnew, np.log(lamb)))
-
-        return X, U, cost
-
     def simulate(self, x0, U):
         """do a rollout of the system, starting at x0 and
         applying the control sequence U
@@ -276,7 +156,6 @@ class Control:
         """
         tN = U.shape[0]
         num_states = x0.shape[0]
-        dt = self.arm.dt
 
         X = np.zeros((tN, num_states))
         X[0] = x0
@@ -291,3 +170,152 @@ class Control:
         cost += self.terminal_cost(X[-1])[0]
 
         return X, cost
+
+    def forward_pass(self, X, U):
+        """linearly approximate the dynamics, and quadratically approximate the cost function so we can use LQR methods"""
+
+        tN = X.shape[0]  # number of time steps
+        num_states = X.shape[1]  # number of states (position and velocity)
+        dof = self.arm.DOF  # number of degrees of freedom of plant
+
+        # for storing linearized dynamics: x(t+1) = f(x(t), u(t))
+        f_x = np.zeros((tN, num_states, num_states))  # df / dx
+        f_u = np.zeros((tN, num_states, dof))  # df / du
+
+        # for storing quadratized cost function
+        l_x = np.zeros((tN, num_states))  # dl / dx
+        l_xx = np.zeros((tN, num_states, num_states))  # d^2 l / dx^2
+        l_u = np.zeros((tN, dof))  # dl / du
+        l_uu = np.zeros((tN, dof, dof))  # d^2 l / du^2
+        l_ux = np.zeros((tN, dof, num_states))  # d^2 l / du / dx
+
+        # for everything except final state
+        for t in range(tN - 1):
+            f_x[t], f_u[t] = self.plant_dynamics_grad(X[t], U[t])
+            _, l_x[t], l_xx[t], l_u[t], l_uu[t], l_ux[t] = self.running_cost(X[t], U[t])
+
+        # aaaand for final state
+        _, l_x[-1], l_xx[-1] = self.terminal_cost(X[-1])
+
+        return f_x, f_u, l_x, l_xx, l_u, l_uu, l_ux
+
+    def backward_pass(self, lamb, f_x, f_u, l_x, l_xx, l_u, l_uu, l_ux):
+        tN = f_x.shape[0]  # number of time steps
+        dof = self.arm.DOF  # number of degrees of freedom of plant
+        num_states = dof * 2  # number of states (position and velocity)
+
+        k = np.zeros((tN, dof))  # feedforward modification
+        K = np.zeros((tN, dof, num_states))  # feedback gain
+
+        # optimize things!
+        # initialize Vs with final state cost and set up k, K
+        V_x = l_x[-1].copy()  # dV / dx
+        V_xx = l_xx[-1].copy()  # d^2 V / dx^2
+
+        # work backwards to solve for V, Q, k, and K
+        for t in reversed(range(tN - 1)):
+
+            # NOTE: we're working backwards, so V_x = V_x[t+1] = V'_x
+            Q_x = l_x[t] + f_x[t].T @ V_x  # 4a)
+            Q_u = l_u[t] + f_u[t].T @ V_x  # 4b)
+
+            # NOTE: last term for Q_xx, Q_uu, and Q_ux is vector / tensor product
+            # but also note f_xx = f_uu = f_ux = 0 so they're all 0 anyways.
+            Q_xx = l_xx[t] + f_x[t].T @ V_xx @ f_x[t]  # 4c)
+            Q_ux = l_ux[t] + f_u[t].T @ V_xx @ f_x[t]  # 4d)
+            Q_uu = l_uu[t] + f_u[t].T @ V_xx @ f_u[t]  # 4e)
+
+            # Calculate Q_uu^-1 with regularization term set by
+            # Levenberg-Marquardt heuristic (at end of this loop)
+            Q_uu_evals, Q_uu_evecs = np.linalg.eig(Q_uu)
+            Q_uu_evals[Q_uu_evals < 0] = 0.0
+            Q_uu_evals += lamb
+            Q_uu_inv = Q_uu_evecs @ np.diag(1.0 / Q_uu_evals) @ Q_uu_evecs.T
+
+            k[t] = -Q_uu_inv @ Q_u  # 5b)
+            K[t] = -Q_uu_inv @ Q_ux  # 5b)
+
+            V_x = Q_x - K[t].T @ Q_uu @ k[t]  # 6b)
+            V_xx = Q_xx - K[t].T @ Q_uu @ K[t]  # 6c)
+
+        return k, K
+
+    def calculate_step(self, X, U, k, K):
+        tN = U.shape[0]  # number of time steps
+        num_states = X.shape[1]  # number of states (position and velocity)
+        dof = self.arm.DOF  # number of degrees of freedom of plant
+
+        # calculate the optimal change to the control trajectory
+        Xnew = np.zeros((tN, num_states))
+        Unew = np.zeros((tN, dof))
+        Xnew[0] = X[0]
+        costnew = 0
+
+        for t in range(tN - 1):
+            # use feedforward (k) and feedback (K) gain matrices
+            # calculated from our value function approximation
+            # to take a stab at the optimal control signal
+            Unew[t] = U[t] + k[t] + K[t] @ (Xnew[t] - X[t])  # 7b)
+
+            costnew += self.running_cost(Xnew[t], Unew[t])[0]
+
+            # given this u, find our next state
+            Xnew[t + 1] = self.plant_dynamics(Xnew[t], Unew[t])  # 7c)
+
+        costnew += self.terminal_cost(Xnew[t])[0]
+
+        return Xnew, Unew, costnew
+
+    def ilqr(self, x0, U):
+        """use iterative linear quadratic regulation to find a control
+        sequence that minimizes the cost function
+
+        x0 np.array: the initial state of the system
+        U np.array: the initial control trajectory dimensions = [dof, time]
+        """
+        Xs, Us = [], []
+        lamb = 1.0  # regularization parameter
+
+        # simulate forward using the current control trajectory
+        X, cost = self.simulate(x0, U)
+
+        for i in range(self.max_iter):
+
+            derivatives = self.forward_pass(X, U)
+
+            gains = self.backward_pass(lamb, *derivatives)
+
+            Xnew, Unew, costnew = self.calculate_step(X, U, *gains)
+
+            # Levenberg-Marquardt heuristic
+            if costnew < cost:
+
+                # decrease lambda (get closer to Newton's method)
+                lamb /= self.lamb_factor
+
+                Xs.append(X)
+                Us.append(U)
+
+                X, U = Xnew, Unew  # update trajectory and control signal
+
+                improvement = abs(cost - costnew) / costnew
+                cost = costnew
+
+                # check to see if update is small enough to exit
+                if i > 0 and improvement < self.eps_converge:
+                    print("Converged!")
+                    break
+            else:
+                # increase lambda (get closer to gradient descent)
+                lamb *= self.lamb_factor
+
+                if lamb > self.lamb_max:
+                    print("Lambda exceeded max value")
+                    break
+
+        Xs.append(X)
+        Us.append(U)
+
+        print("Finished at iteration = %d; Cost = %.4f; logLambda = %.1f" % (i, costnew, np.log(lamb)))
+
+        return Xs, Us, cost
