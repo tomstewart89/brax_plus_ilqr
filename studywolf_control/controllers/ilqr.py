@@ -19,6 +19,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
 import numpy as np
+import jax.numpy as jnp
+from jax import grad, jacrev
 
 
 def finite_differences(f, x, eps=1e-4):
@@ -36,11 +38,6 @@ def finite_differences(f, x, eps=1e-4):
         D[:, i] = df_dxi
 
     return D
-
-
-def to_cart(r, theta):
-    """Convert a polar coordinate (r,theta) into a cartesian coordinate"""
-    return r * np.array([np.cos(theta), np.sin(theta)])
 
 
 class Control:
@@ -65,69 +62,18 @@ class Control:
         self.terminal_wv = 1e5  # terminal velocity cost weight
 
     def running_cost(self, x, u):
-        """the intermediate state cost function"""
-        dof = u.shape[0]
-        num_states = x.shape[0]
-
-        l = self.running_w * np.sum(u**2)
-
-        # compute derivatives of cost
-        l_x = np.zeros(num_states)
-        l_xx = np.zeros((num_states, num_states))
-
-        l_u = 2 * self.running_w * u
-        l_uu = 2 * self.running_w * np.eye(dof)
-        l_ux = np.zeros((dof, num_states))
-
-        # returned in an array for easy multiplication by time step
-        return l, l_x, l_xx, l_u, l_uu, l_ux
+        return self.running_w * (u**2).sum()
 
     def terminal_cost(self, x):
         """the final state cost function"""
 
-        num_states = x.shape[0]
-        dof = self.arm.DOF
+        l1 = self.arm.L[0] * jnp.array([jnp.cos(jnp.sum(x[:1])), jnp.sin(jnp.sum(x[:1]))])
+        l2 = self.arm.L[1] * jnp.array([jnp.cos(jnp.sum(x[:2])), jnp.sin(jnp.sum(x[:2]))])
+        l3 = self.arm.L[2] * jnp.array([jnp.cos(jnp.sum(x[:3])), jnp.sin(jnp.sum(x[:3]))])
 
-        l = self.terminal_wp * np.sum((self.arm.x - self.target) ** 2) + self.terminal_wv * np.sum(
-            x[dof:] ** 2
+        return self.terminal_wp * jnp.sum((l1 + l2 + l3 - self.target) ** 2) + self.terminal_wv * jnp.sum(
+            x[3:] ** 2
         )
-
-        l_x = np.zeros(num_states)
-        l_x[:dof] = self.terminal_wp * self.endpoint_error_grad(x[:dof])
-        l_x[dof:] = 2 * self.terminal_wv * x[dof:]
-
-        l_xx = np.zeros((num_states, num_states))
-        l_xx[:dof, :dof] = self.terminal_wp * finite_differences(self.endpoint_error_grad, x[:dof])
-        l_xx[dof:, dof:] = 2 * self.terminal_wv * np.eye(dof)
-
-        # Final cost only requires these three values
-        return l, l_x, l_xx
-
-    def endpoint_error_grad(self, x):
-        """Compute derivative of endpoint error"""
-
-        end_pos = np.sum([to_cart(self.arm.L[i], np.sum(x[: i + 1])) for i in range(self.arm.DOF)], axis=0)
-        error = end_pos - self.target
-
-        error_dot = np.zeros(self.arm.DOF + 1)
-
-        for i in reversed(range(self.arm.DOF)):
-            theta = np.sum(x[: i + 1])
-            error_dot[i] = 2 * self.arm.L[i] * error.dot([-np.sin(theta), np.cos(theta)]) + error_dot[i + 1]
-
-        return error_dot[:-1]
-
-    def plant_dynamics_grad(self, x, u):
-        """calculate derivative of plant dynamics using finite differences
-
-        x np.array: the state of the system
-        u np.array: the control signal
-        """
-
-        f_x = finite_differences(lambda d: self.plant_dynamics(d, u), x)
-        f_u = finite_differences(lambda d: self.plant_dynamics(x, d), u)
-
-        return f_x, f_u
 
     def plant_dynamics(self, x, u):
         """simulate a single time step of the plant, from
@@ -136,10 +82,8 @@ class Control:
         x np.array: the state of the system
         u np.array: the control signal
         """
-        dof = self.arm.DOF
-
         # set the arm position to x
-        self.arm.reset(q=x[:dof], dq=x[dof:])
+        self.arm.reset(q=x[: self.arm.DOF], dq=x[self.arm.DOF :])
 
         # apply the control signal
         self.arm.apply_torque(u)
@@ -155,27 +99,25 @@ class Control:
         U np.array: the control sequence to apply
         """
         tN = U.shape[0]
-        num_states = x0.shape[0]
 
-        X = np.zeros((tN, num_states))
+        X = np.zeros((tN, x0.size))
         X[0] = x0
         cost = 0
 
         # Run simulation with substeps
         for t in range(tN - 1):
             X[t + 1] = self.plant_dynamics(X[t], U[t])
-            cost += self.running_cost(X[t], U[t])[0]
+            cost += self.running_cost(X[t], U[t])
 
         # Adjust for final cost, subsample trajectory
-        cost += self.terminal_cost(X[-1])[0]
+        cost += self.terminal_cost(X[-1])
 
         return X, cost
 
     def forward_pass(self, X, U):
         """linearly approximate the dynamics, and quadratically approximate the cost function so we can use LQR methods"""
 
-        tN = X.shape[0]  # number of time steps
-        num_states = X.shape[1]  # number of states (position and velocity)
+        tN, num_states = X.shape
         dof = self.arm.DOF  # number of degrees of freedom of plant
 
         # for storing linearized dynamics: x(t+1) = f(x(t), u(t))
@@ -191,21 +133,27 @@ class Control:
 
         # for everything except final state
         for t in range(tN - 1):
-            f_x[t], f_u[t] = self.plant_dynamics_grad(X[t], U[t])
-            _, l_x[t], l_xx[t], l_u[t], l_uu[t], l_ux[t] = self.running_cost(X[t], U[t])
+            f_x[t] = finite_differences(lambda d: self.plant_dynamics(d, U[t]), X[t])
+            f_u[t] = finite_differences(lambda d: self.plant_dynamics(X[t], d), U[t])
+
+            l_x[t] = grad(self.running_cost, argnums=0)(X[t], U[t])
+            l_u[t] = grad(self.running_cost, argnums=1)(X[t], U[t])
+            l_xx[t] = jacrev(grad(self.running_cost, argnums=0), argnums=0)(X[t], U[t])
+            l_uu[t] = jacrev(grad(self.running_cost, argnums=1), argnums=1)(X[t], U[t])
+            l_ux[t] = jacrev(grad(self.running_cost, argnums=1), argnums=0)(X[t], U[t])
 
         # aaaand for final state
-        _, l_x[-1], l_xx[-1] = self.terminal_cost(X[-1])
+        l_x[-1] = grad(self.terminal_cost)(X[-1])
+        l_xx[-1] = jacrev(grad(self.terminal_cost))(X[-1])
 
         return f_x, f_u, l_x, l_xx, l_u, l_uu, l_ux
 
     def backward_pass(self, lamb, f_x, f_u, l_x, l_xx, l_u, l_uu, l_ux):
         tN = f_x.shape[0]  # number of time steps
         dof = self.arm.DOF  # number of degrees of freedom of plant
-        num_states = dof * 2  # number of states (position and velocity)
 
         k = np.zeros((tN, dof))  # feedforward modification
-        K = np.zeros((tN, dof, num_states))  # feedback gain
+        K = np.zeros((tN, dof, dof * 2))  # feedback gain
 
         # optimize things!
         # initialize Vs with final state cost and set up k, K
@@ -241,28 +189,25 @@ class Control:
         return k, K
 
     def calculate_step(self, X, U, k, K):
-        tN = U.shape[0]  # number of time steps
-        num_states = X.shape[1]  # number of states (position and velocity)
-        dof = self.arm.DOF  # number of degrees of freedom of plant
+        """calculate the optimal change to the control trajectory"""
 
-        # calculate the optimal change to the control trajectory
-        Xnew = np.zeros((tN, num_states))
-        Unew = np.zeros((tN, dof))
+        Xnew = np.zeros_like(X)
+        Unew = np.zeros_like(U)
         Xnew[0] = X[0]
         costnew = 0
 
-        for t in range(tN - 1):
+        for t in range(U.shape[0] - 1):
             # use feedforward (k) and feedback (K) gain matrices
             # calculated from our value function approximation
             # to take a stab at the optimal control signal
             Unew[t] = U[t] + k[t] + K[t] @ (Xnew[t] - X[t])  # 7b)
 
-            costnew += self.running_cost(Xnew[t], Unew[t])[0]
+            costnew += self.running_cost(Xnew[t], Unew[t])
 
             # given this u, find our next state
             Xnew[t + 1] = self.plant_dynamics(Xnew[t], Unew[t])  # 7c)
 
-        costnew += self.terminal_cost(Xnew[t])[0]
+        costnew += self.terminal_cost(Xnew[t])
 
         return Xnew, Unew, costnew
 
@@ -273,7 +218,6 @@ class Control:
         x0 np.array: the initial state of the system
         U np.array: the initial control trajectory dimensions = [dof, time]
         """
-        Xs, Us = [], []
         lamb = 1.0  # regularization parameter
 
         # simulate forward using the current control trajectory
@@ -293,9 +237,6 @@ class Control:
                 # decrease lambda (get closer to Newton's method)
                 lamb /= self.lamb_factor
 
-                Xs.append(X)
-                Us.append(U)
-
                 X, U = Xnew, Unew  # update trajectory and control signal
 
                 improvement = abs(cost - costnew) / costnew
@@ -313,9 +254,6 @@ class Control:
                     print("Lambda exceeded max value")
                     break
 
-        Xs.append(X)
-        Us.append(U)
-
         print("Finished at iteration = %d; Cost = %.4f; logLambda = %.1f" % (i, costnew, np.log(lamb)))
 
-        return Xs, Us, cost
+        return X, U, cost
