@@ -46,50 +46,31 @@ class Control:
     Controls the (x,y) position of a robotic arm end-effector.
     """
 
-    def __init__(self, n=50, max_iter=100, **kwargs):
+    def __init__(
+        self,
+        running_cost_fn,
+        terminal_cost_fn,
+        plant_dynamics_fn,
+        num_states,
+        num_controls,
+        n=50,
+        max_iter=100,
+    ):
         """
         n int: length of the control sequence
         max_iter int: limit on number of optimization iterations
         """
 
         self.tN = n  # number of timesteps
+        self.num_states = num_states
+        self.num_controls = num_controls
         self.max_iter = max_iter
         self.lamb_factor = 10
         self.lamb_max = 1000
         self.eps_converge = 0.001  # exit if relative improvement below threshold
-        self.running_w = 1e-2  # running cost weight
-        self.terminal_wp = 1e5  # terminal position cost weight
-        self.terminal_wv = 1e5  # terminal velocity cost weight
-
-    def running_cost(self, x, u):
-        return self.running_w * (u**2).sum()
-
-    def terminal_cost(self, x):
-        """the final state cost function"""
-
-        l1 = self.arm.L[0] * jnp.array([jnp.cos(jnp.sum(x[:1])), jnp.sin(jnp.sum(x[:1]))])
-        l2 = self.arm.L[1] * jnp.array([jnp.cos(jnp.sum(x[:2])), jnp.sin(jnp.sum(x[:2]))])
-        l3 = self.arm.L[2] * jnp.array([jnp.cos(jnp.sum(x[:3])), jnp.sin(jnp.sum(x[:3]))])
-
-        return self.terminal_wp * jnp.sum((l1 + l2 + l3 - self.target) ** 2) + self.terminal_wv * jnp.sum(
-            x[3:] ** 2
-        )
-
-    def plant_dynamics(self, x, u):
-        """simulate a single time step of the plant, from
-        initial state x and applying control signal u
-
-        x np.array: the state of the system
-        u np.array: the control signal
-        """
-        # set the arm position to x
-        self.arm.reset(q=x[: self.arm.DOF], dq=x[self.arm.DOF :])
-
-        # apply the control signal
-        self.arm.apply_torque(u)
-
-        # get the system state from the arm
-        return np.hstack([np.copy(self.arm.q), np.copy(self.arm.dq)])
+        self.running_cost = running_cost_fn
+        self.terminal_cost = terminal_cost_fn
+        self.plant_dynamics = plant_dynamics_fn
 
     def simulate(self, x0, U):
         """do a rollout of the system, starting at x0 and
@@ -98,14 +79,12 @@ class Control:
         x0 np.array: the initial state of the system
         U np.array: the control sequence to apply
         """
-        tN = U.shape[0]
-
-        X = np.zeros((tN, x0.size))
+        X = np.zeros((self.tN, self.num_states))
         X[0] = x0
         cost = 0
 
         # Run simulation with substeps
-        for t in range(tN - 1):
+        for t in range(self.tN - 1):
             X[t + 1] = self.plant_dynamics(X[t], U[t])
             cost += self.running_cost(X[t], U[t])
 
@@ -117,22 +96,19 @@ class Control:
     def forward_pass(self, X, U):
         """linearly approximate the dynamics, and quadratically approximate the cost function so we can use LQR methods"""
 
-        tN, num_states = X.shape
-        dof = self.arm.DOF  # number of degrees of freedom of plant
-
         # for storing linearized dynamics: x(t+1) = f(x(t), u(t))
-        f_x = np.zeros((tN, num_states, num_states))  # df / dx
-        f_u = np.zeros((tN, num_states, dof))  # df / du
+        f_x = np.zeros((self.tN, self.num_states, self.num_states))  # df / dx
+        f_u = np.zeros((self.tN, self.num_states, self.num_controls))  # df / du
 
         # for storing quadratized cost function
-        l_x = np.zeros((tN, num_states))  # dl / dx
-        l_xx = np.zeros((tN, num_states, num_states))  # d^2 l / dx^2
-        l_u = np.zeros((tN, dof))  # dl / du
-        l_uu = np.zeros((tN, dof, dof))  # d^2 l / du^2
-        l_ux = np.zeros((tN, dof, num_states))  # d^2 l / du / dx
+        l_x = np.zeros((self.tN, self.num_states))  # dl / dx
+        l_xx = np.zeros((self.tN, self.num_states, self.num_states))  # d^2 l / dx^2
+        l_u = np.zeros((self.tN, self.num_controls))  # dl / du
+        l_uu = np.zeros((self.tN, self.num_controls, self.num_controls))  # d^2 l / du^2
+        l_ux = np.zeros((self.tN, self.num_controls, self.num_states))  # d^2 l / du / dx
 
         # for everything except final state
-        for t in range(tN - 1):
+        for t in range(self.tN - 1):
             f_x[t] = finite_differences(lambda d: self.plant_dynamics(d, U[t]), X[t])
             f_u[t] = finite_differences(lambda d: self.plant_dynamics(X[t], d), U[t])
 
@@ -149,11 +125,9 @@ class Control:
         return f_x, f_u, l_x, l_xx, l_u, l_uu, l_ux
 
     def backward_pass(self, lamb, f_x, f_u, l_x, l_xx, l_u, l_uu, l_ux):
-        tN = f_x.shape[0]  # number of time steps
-        dof = self.arm.DOF  # number of degrees of freedom of plant
 
-        k = np.zeros((tN, dof))  # feedforward modification
-        K = np.zeros((tN, dof, dof * 2))  # feedback gain
+        k = np.zeros((self.tN, self.num_controls))  # feedforward modification
+        K = np.zeros((self.tN, self.num_controls, self.num_states))  # feedback gain
 
         # optimize things!
         # initialize Vs with final state cost and set up k, K
@@ -161,7 +135,7 @@ class Control:
         V_xx = l_xx[-1].copy()  # d^2 V / dx^2
 
         # work backwards to solve for V, Q, k, and K
-        for t in reversed(range(tN - 1)):
+        for t in reversed(range(self.tN - 1)):
 
             # NOTE: we're working backwards, so V_x = V_x[t+1] = V'_x
             Q_x = l_x[t] + f_x[t].T @ V_x  # 4a)
@@ -196,7 +170,7 @@ class Control:
         Xnew[0] = X[0]
         costnew = 0
 
-        for t in range(U.shape[0] - 1):
+        for t in range(self.tN - 1):
             # use feedforward (k) and feedback (K) gain matrices
             # calculated from our value function approximation
             # to take a stab at the optimal control signal
