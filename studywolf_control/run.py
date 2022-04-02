@@ -6,16 +6,19 @@ from arms.three_link.arm import Arm
 from controllers.ilqr import Control
 import numpy as np
 import jax.numpy as jnp
+import jax
 import matplotlib.pyplot as plt
 
 arm = Arm(dt=1e-2)
 target = np.random.random(size=(2,)) * np.sum(arm.L) * 0.75
 
 
+@jax.jit
 def running_cost(x, u):
     return 1e-2 * (u**2).sum()
 
 
+@jax.jit
 def terminal_cost(x):
     """the final state cost function"""
 
@@ -46,9 +49,40 @@ def plant_dynamics(x, u):
 controller = Control(running_cost, terminal_cost, plant_dynamics, arm.DOF * 2, arm.DOF)
 
 x0 = np.zeros(arm.DOF * 2)
-U = np.zeros((controller.tN, arm.DOF))
+U = np.random.random((controller.tN, arm.DOF))
 X, U, cost = controller.ilqr(x0, U)
 
 print(arm.x, target)
 plt.plot(X)
 plt.show()
+
+
+# import brax
+# import jax
+# import jax.numpy as jp
+# from google.protobuf import text_format
+
+# with open("/home/tom/Desktop/reacher.proto", "r") as f:
+#     config_proto = f.read()
+
+# config = text_format.Parse(config_proto, brax.Config())
+# sys = brax.System(config)
+
+# qpos = sys.default_angle()
+# qvel = jp.zeros(sys.num_joint_dof)
+# qp = sys.default_qp(joint_angle=qpos, joint_velocity=qvel)
+# qp = brax.QP(jp.array(qp.pos), jp.array(qp.rot), jp.array(qp.vel), jp.array(qp.ang))
+
+
+# @jax.jit
+# def wrap(act):
+#     new_state, _ = sys.step(qp, act)
+#     return jp.mean(new_state.pos)
+
+
+# a = jp.zeros(3)
+# f_u = jax.grad(wrap)
+# print(f_u(a))
+# print(f_u(a))
+# print(f_u(a))
+# print(f_u(a))

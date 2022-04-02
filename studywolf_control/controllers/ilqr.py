@@ -19,8 +19,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
 import numpy as np
-import jax.numpy as jnp
-from jax import grad, jacrev
+from jax import grad, jacrev, jit, vmap
 
 
 def finite_differences(f, x, eps=1e-4):
@@ -66,11 +65,19 @@ class Control:
         self.num_controls = num_controls
         self.max_iter = max_iter
         self.lamb_factor = 10
-        self.lamb_max = 1000
+        self.lamb_max = 10000
         self.eps_converge = 0.001  # exit if relative improvement below threshold
         self.running_cost = running_cost_fn
         self.terminal_cost = terminal_cost_fn
         self.plant_dynamics = plant_dynamics_fn
+
+        self.d_running_cost_dx = jit(grad(self.running_cost, argnums=0))
+        self.d_running_cost_du = jit(grad(self.running_cost, argnums=1))
+        self.d2_running_cost_dx2 = jit(jacrev(grad(self.running_cost, argnums=0), argnums=0))
+        self.d2_running_cost_du2 = jit(jacrev(grad(self.running_cost, argnums=1), argnums=1))
+        self.d2_running_cost_dux = jit(jacrev(grad(self.running_cost, argnums=1), argnums=0))
+        self.d_terminal_cost_dx = jit(grad(self.terminal_cost))
+        self.d2_terminal_cost_dx2 = jit(jacrev(grad(self.terminal_cost)))
 
     def simulate(self, x0, U):
         """do a rollout of the system, starting at x0 and
@@ -96,31 +103,36 @@ class Control:
     def forward_pass(self, X, U):
         """linearly approximate the dynamics, and quadratically approximate the cost function so we can use LQR methods"""
 
-        # for storing linearized dynamics: x(t+1) = f(x(t), u(t))
+        l_x = np.vstack(
+            [vmap(self.d_running_cost_dx)(X[:-1], U[:-1]), self.d_terminal_cost_dx(X[-1])[None, :]]
+        )
+
+        l_u = np.vstack([vmap(self.d_running_cost_du)(X[:-1], U[:-1]), np.zeros((1, self.num_controls))])
+
+        l_xx = np.vstack(
+            [vmap(self.d2_running_cost_dx2)(X[:-1], U[:-1]), self.d2_terminal_cost_dx2(X[-1])[None, :, :]]
+        )
+
+        l_uu = np.vstack(
+            [
+                vmap(self.d2_running_cost_du2)(X[:-1], U[:-1]),
+                np.zeros((1, self.num_controls, self.num_controls)),
+            ]
+        )
+
+        l_ux = np.vstack(
+            [
+                vmap(self.d2_running_cost_dux)(X[:-1], U[:-1]),
+                np.zeros((1, self.num_controls, self.num_states)),
+            ]
+        )
+
         f_x = np.zeros((self.tN, self.num_states, self.num_states))  # df / dx
         f_u = np.zeros((self.tN, self.num_states, self.num_controls))  # df / du
 
-        # for storing quadratized cost function
-        l_x = np.zeros((self.tN, self.num_states))  # dl / dx
-        l_xx = np.zeros((self.tN, self.num_states, self.num_states))  # d^2 l / dx^2
-        l_u = np.zeros((self.tN, self.num_controls))  # dl / du
-        l_uu = np.zeros((self.tN, self.num_controls, self.num_controls))  # d^2 l / du^2
-        l_ux = np.zeros((self.tN, self.num_controls, self.num_states))  # d^2 l / du / dx
-
-        # for everything except final state
         for t in range(self.tN - 1):
             f_x[t] = finite_differences(lambda d: self.plant_dynamics(d, U[t]), X[t])
             f_u[t] = finite_differences(lambda d: self.plant_dynamics(X[t], d), U[t])
-
-            l_x[t] = grad(self.running_cost, argnums=0)(X[t], U[t])
-            l_u[t] = grad(self.running_cost, argnums=1)(X[t], U[t])
-            l_xx[t] = jacrev(grad(self.running_cost, argnums=0), argnums=0)(X[t], U[t])
-            l_uu[t] = jacrev(grad(self.running_cost, argnums=1), argnums=1)(X[t], U[t])
-            l_ux[t] = jacrev(grad(self.running_cost, argnums=1), argnums=0)(X[t], U[t])
-
-        # aaaand for final state
-        l_x[-1] = grad(self.terminal_cost)(X[-1])
-        l_xx[-1] = jacrev(grad(self.terminal_cost))(X[-1])
 
         return f_x, f_u, l_x, l_xx, l_u, l_uu, l_ux
 
@@ -198,6 +210,8 @@ class Control:
         X, cost = self.simulate(x0, U)
 
         for i in range(self.max_iter):
+
+            print("it: {}, cost: {}".format(i, cost))
 
             derivatives = self.forward_pass(X, U)
 
