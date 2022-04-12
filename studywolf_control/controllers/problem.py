@@ -1,47 +1,22 @@
 import brax
+import brax.jumpy as jp
+from brax.math import rotate
 from jax import grad, jacrev, jit
-import jax
-import jax.numpy as jnp
-import numpy as np
 from google.protobuf import text_format
-
-import sys
-
-sys.path.append("/home/tom/repos/control/studywolf_control/controllers")
-
-from arms.three_link.arm import Arm
-
-
-def finite_differences(f, x, eps=1e-4):
-    """Differentiate a function `f` using finite differences"""
-    p = np.zeros_like(x)
-
-    for i in range(x.size):
-        p[i] = eps
-        df_dxi = (f(x + p) - f(x - p)) / (2 * eps)
-        p[i] = 0.0
-
-        if i == 0:
-            D = np.zeros((df_dxi.size, x.size))
-
-        D[:, i] = df_dxi
-
-    return D
 
 
 class ReacherProblem:
     def __init__(self):
         self.sys = brax.System(text_format.Parse(ReacherProblem.config, brax.Config()))
-        self.arm = Arm(dt=1e-2)
 
-        self.sys.default_qp()
-
-        self.num_controls = self.arm.DOF
-        self.num_states = self.arm.DOF * 2
+        self.num_controls = self.sys.num_actuators
+        self.num_states = self.sys.num_joints * 2
         self.num_timesteps = 50
 
-        self.target = np.random.random(2) * np.sum(self.arm.L) * 0.75
+        self.target = jp.array([0.0, 0.1, 0.0])
 
+        self.f_x = jit(jacrev(self.step, argnums=0))
+        self.f_u = jit(jacrev(self.step, argnums=1))
         self.lt_x = jit(grad(self.running_cost, argnums=0))
         self.lt_u = jit(grad(self.running_cost, argnums=1))
         self.lt_xx = jit(jacrev(grad(self.running_cost, argnums=0), argnums=0))
@@ -50,18 +25,20 @@ class ReacherProblem:
         self.lT_x = jit(grad(self.terminal_cost))
         self.lT_xx = jit(jacrev(grad(self.terminal_cost)))
 
-    def step(self, x, u):
-        brax.QP()
+    def to_reduced_coordinates(self, qp):
+        rel_rot = jp.vmap(brax.math.relative_quat)(qp.rot[0:2], qp.rot[1:3])
+        joint_angles = jp.vmap(brax.math.quat_to_axis_angle)(rel_rot)[1]
+
+        rel_ang = qp.ang[0:2] - qp.ang[1:3]
+        joint_velocities = rel_ang[:, 2]
+
+        return jp.concatenate([joint_angles, joint_velocities])
+
+    def to_maximal_coordinates(self, x):
+        return self.sys.default_qp(joint_angle=x[:2], joint_velocity=x[2:])
 
     def step(self, x, u):
-        # set the arm position to x
-        self.arm.reset(q=x[: self.arm.DOF], dq=x[self.arm.DOF :])
-
-        # apply the control signal
-        self.arm.apply_torque(u)
-
-        # get the system state from the arm
-        return np.hstack([np.copy(self.arm.q), np.copy(self.arm.dq)])
+        return self.to_reduced_coordinates(self.sys.step(self.to_maximal_coordinates(x), u)[0])
 
     def running_cost(self, x, u):
         return 1e-2 * (u**2).sum()
@@ -69,17 +46,13 @@ class ReacherProblem:
     def terminal_cost(self, x):
         """the final state cost function"""
 
-        l1 = self.arm.L[0] * jnp.array([jnp.cos(jnp.sum(x[:1])), jnp.sin(jnp.sum(x[:1]))])
-        l2 = self.arm.L[1] * jnp.array([jnp.cos(jnp.sum(x[:2])), jnp.sin(jnp.sum(x[:2]))])
-        l3 = self.arm.L[2] * jnp.array([jnp.cos(jnp.sum(x[:3])), jnp.sin(jnp.sum(x[:3]))])
+        qp = self.to_maximal_coordinates(x)
 
-        return 1e5 * jnp.sum((l1 + l2 + l3 - self.target) ** 2) + 1e5 * jnp.sum(x[3:] ** 2)
+        jp.array([self.sys.config.bodies[2].colliders[0].capsule.length, 0, 0])
 
-    def f_x(self, x, u):
-        return finite_differences(lambda d: self.step(d, u), x)
-
-    def f_u(self, x, u):
-        return finite_differences(lambda d: self.step(x, d), u)
+        return 1e5 * jp.sum((self.to_maximal_coordinates(x).pos[2] - self.target) ** 2) + 1e5 * jp.sum(
+            x[2:] ** 2
+        )
 
     config = """
     bodies {
@@ -145,23 +118,6 @@ class ReacherProblem:
         z: 1.0
         }
         mass: 0.035604715
-    }
-    bodies {
-        name: "target"
-        colliders {
-        position {
-        }
-        sphere {
-            radius: 0.009
-        }
-        }
-        inertia {
-        x: 1.0
-        y: 1.0
-        z: 1.0
-        }
-        mass: 1.0
-        frozen { all: true }
     }
     joints {
         name: "joint0"
